@@ -44,7 +44,8 @@ module Parameters
 import Base: @__doc__
 import OrderedCollections: OrderedDict
 
-export @with_kw, @with_kw_noshow, type2dict, reconstruct, @unpack, @pack!, @pack
+export @with_kw, @with_kw_noshow, type2dict, reconstruct, @unpack, @pack!, @pack,
+@params, params, ranges, constructor
 
 ## Parser helpers
 #################
@@ -262,6 +263,53 @@ end
 
 const macro_hidden_nargs = length(:(@m).args) - 1 # ==1 on Julia 0.6, ==2 on Julia 0.7
 
+is_range_defined(v) =  hasproperty(v, :range) && v.range !== nothing
+function ranges(params)
+    ranges = []
+    keys = Symbol[]
+    for (k, v) in pairs(params)
+        if is_range_defined(v)
+            push!(ranges, v.range)
+            push!(keys, k)
+        end
+    end
+    (keys = keys, ranges = ranges)
+end
+function constructor(T; kwargs...)
+    let p = params(T; kwargs...)
+        keyswithrange = [k for (k, v) in pairs(p) if is_range_defined(v)]
+        x -> T(; kwargs..., NamedTuple{tuple(keyswithrange...)}(tuple(x...))...)
+    end
+end
+parametrizable(::Any) = false
+checkparams(::Any, k, w) = w
+params(::Any) = tuple()
+const DROP_PARAM = Symbol("#drop")
+function expand(nt)
+    keys = []
+    values = []
+    expanded = []
+    for (k, v) in pairs(nt)
+        if hasproperty(v, :default) && parametrizable(v.default)
+            v = v.default
+        end
+        if parametrizable(v)
+            push!(expanded, params(v; merge(nt, NamedTuple{tuple(k)}(tuple(DROP_PARAM)))...))
+        elseif v !== DROP_PARAM
+            push!(keys, k)
+            push!(values, v)
+        end
+    end
+    merge(NamedTuple{tuple(keys...)}(values), expanded...)
+end
+function namedtuple(kws, kws_extra, mod)
+    ks = tuple(keys(kws)...)
+    NamedTuple{ks}(tuple([(default = typeof(kws[k]) == Symbol && hasproperty(mod, kws[k]) ? @eval(mod, $(kws[k])) : kws[k],
+                           range = @eval(mod, $(kws_extra[k]))) for k in ks]...))
+end
+const WARN_IF_OUT_OF_RANGE = [true]
+toggle_range_warnnings() = (global WARN_IF_OUT_OF_RANGE[1] = !WARN_IF_OUT_OF_RANGE[1])[]
+
 """
 This function is called by the `@with_kw` macro and does the syntax
 transformation from:
@@ -299,7 +347,7 @@ macro pack_MM(varname)
 end
 ```
 """
-function with_kw(typedef, mod::Module, withshow=true)
+function with_kw(typedef, mod::Module, withshow=true, params = false)
     if typedef.head==:tuple # named-tuple
         withshow==false && error("`@with_kw_noshow` not supported for named tuples")
         return with_kw_nt(typedef, mod)
@@ -333,7 +381,18 @@ function with_kw(typedef, mod::Module, withshow=true)
     # error on types without fields
     lns = Lines(typedef.args[3])
     if done(lns, start(lns))
-        error("@with_kw only supported for types which have at least one field.")
+         !params && error("@with_kw only supported for types which have at least one field.")
+         typ = Expr(:struct, typedef.args[1:2]...,
+                    Expr(:block, Expr(:(=), :($(typedef.args[2])(; kwargs...) where {$(typparas...)}),
+                                      Expr(:block, Expr(:call, :new)))))
+         return quote
+             $typ
+             Parameters.parametrizable(::Type{$tn}) = true
+             function Parameters.params(::Type{$tn}; expand = true, kwargs...)
+                 tuple()
+             end
+             $tn
+        end
     end
     # default type @deftype
     l, i = next(lns, start(lns))
@@ -385,6 +444,7 @@ function with_kw(typedef, mod::Module, withshow=true)
     fielddefs = quote end # holds r::R etc
     fielddefs.args = Any[] # in julia 0.5 this is [:( # /home/mauro/.julia/v0.5/Parameters/src/Parameters.jl, line 228:)]
     kws = OrderedDict{Any, Any}()
+    params && (kws_extra = OrderedDict{Any, Any}())
     # assertions in the body
     asserts = Any[]
     for (i,l) in enumerate(lns) # loop over body of typedef
@@ -425,9 +485,20 @@ function with_kw(typedef, mod::Module, withshow=true)
                     push!(fielddefs.args, docstring)
                 end
                 push!(fielddefs.args, fld)
-                kws[decolon2(fld)] = l.args[2]
+                sym = decolon2(fld)
+                if params
+                    if l.args[2] isa Expr && l.args[2].args[1] ∈ (:in, :∈)
+                        kws[sym] = l.args[2].args[2]
+                        kws_extra[sym] = l.args[2].args[3]
+                    else
+                        kws[sym] = l.args[2]
+                        kws_extra[sym] = nothing
+                    end
+                else
+                    kws[sym] = l.args[2]
+                end
                 # unwrap-macro
-                push!(unpack_vars, decolon2(fld))
+                push!(unpack_vars, sym)
             end
         elseif l.head==:macrocall  && l.args[1]==Symbol("@assert")
             # store all asserts
@@ -454,16 +525,31 @@ function with_kw(typedef, mod::Module, withshow=true)
     # provide a special positional constructor (say enforcing
     # invariants) which also gets used with the keywords.
     args = Any[]
+    params && (paramsargs = Any[])
     kwargs = Expr(:parameters)
     for (k,w) in kws
+        if params
+            if WARN_IF_OUT_OF_RANGE[1] && kws_extra[k] !== nothing
+                errormsg = "$k not in $(kws_extra[k])"
+                isinrange = :($k ∉ $(kws_extra[k]) && @warn($errormsg))
+            else
+                isinrange = :()
+            end
+        end
+        params && push!(paramsargs,
+                        :(begin
+                              $isinrange
+                              Parameters.parametrizable($k) ? $k(; kwargs...) : $k
+                          end))
         push!(args, k)
         push!(kwargs.args, Expr(:kw,k,w))
     end
+    params && push!(kwargs.args, :(kwargs...))
     if length(typparas)>0
         tps = stripsubtypes(typparas)
-        innerc = :( $tn{$(tps...)}($kwargs) where {$(tps...)} = $tn{$(tps...)}($(args...)))
+        innerc = :( $tn{$(tps...)}($kwargs) where {$(tps...)} = $tn{$(tps...)}($((params ? paramsargs : args)...)))
     else
-        innerc = :($tn($kwargs) = $tn($(args...)) )
+        innerc = :($tn($kwargs) = $tn($((params ? paramsargs : args)...)) )
     end
     push!(typ.args[3].args, innerc)
 
@@ -515,13 +601,28 @@ function with_kw(typedef, mod::Module, withshow=true)
     if typparas==Any[]
         outer_kw=:()
     else
-        outer_kw = :($tn($kwargs) = $tn($(args...)) )
+        outer_kw = :($tn($kwargs) = $tn($((params ? paramsargs : args)...)) )
     end
     # NOTE: The reason to have both outer and inner keyword
     # constructors are to allow both calls:
     #   `MT4(r=4, a=5.0)` (outer kwarg-constructor) and
     #   `MT4{Float32, Int}(r=4, a=5.)` (inner kwarg constructor).
 
+    if params
+        params_func = quote
+            Parameters.parametrizable(::Type{$tn}) = true
+            function Parameters.params(::Type{$tn}; expand = true, kwargs...)
+                nt = merge($(namedtuple(kws, kws_extra, mod)), kwargs)
+                if expand
+                    Parameters.expand(nt)
+                else
+                    nt
+                end
+            end
+        end
+    else
+        params_func = :()
+    end
     ## outer copy constructor
     ###
     outer_copy = quote
@@ -569,6 +670,7 @@ function with_kw(typedef, mod::Module, withshow=true)
     quote
         Base.@__doc__ $typ
         $outer_positional
+        $params_func
         $outer_kw
         $outer_copy
         $showfn
@@ -629,6 +731,10 @@ For more details see manual.
 """
 macro with_kw(typedef)
     return esc(with_kw(typedef, __module__, true))
+end
+
+macro params(typedef)
+    return esc(with_kw(typedef, __module__, true, true))
 end
 
 macro with_kw(args...)
